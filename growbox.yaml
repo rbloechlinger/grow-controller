@@ -1,0 +1,584 @@
+# light:
+#   - platform: esp32_rmt_led_strip   # fastled is incompatible with esp-idf; this is the right one
+#     id: status_led
+#     pin: GPIO21                     # StampS3 onboard WS2812
+#     num_leds: 1
+#     rgb_order: GRB
+#     chipset: ws2812
+#     rmt_symbols: 48
+#     default_transition_length: 0s
+
+# interval:
+#   - interval: 1s
+#     then:
+#       - light.toggle: status_led    # liveness heartbeat: needs no log, no radio
+
+
+# =============================================================================
+# Growbox controller -- M5Stack Stamp S3  (cuttings / propagation box)
+# Pure ESP-NOW (no WiFi): fixed channel, bidirectional link to the Cardputer.
+#   - sends temperature/humidity/fan/humidifier/mode/uptime after every DHT
+#     reading AND after every executed command (instant feedback)
+#   - receives commands (set target, manual fan toggle, manual humidifier
+#     toggle, back to auto, manual DHT refresh, backlog request)
+#
+# UNIFIED CONTROL MODE (v5):
+#   There is ONE global mode, AUTO or MANUAL, for the whole system. The
+#   climate component's mode is the single source of truth:
+#       CLIMATE_MODE_COOL = AUTO     CLIMATE_MODE_OFF = MANUAL
+#   In AUTO the fan bang_bang AND the humidity hysteresis both run. Any manual
+#   action on EITHER output (CMD_TOGGLE_VENT or CMD_TOGGLE_HUM) drops the whole
+#   system into MANUAL and suspends both automations; the untouched output is
+#   left in its current physical state. CMD_SET_AUTO hands both back to auto.
+#
+# Climate defaults (cuttings):
+#   Temperature: fan ON >= 28 C, OFF <= 24 C (target 28 C, dead band 4 C)
+#   Humidity:    humidifier ON < 75 % RH (pulsed); see burst limiter below.
+#   Venting:     fan ON >= 88 % RH, OFF <= 83 % RH (sheds excess moisture).
+#   NOTE: the DHT11 tops out around 80-90 % RH at +-5 % accuracy -- it is at
+#   the edge of its range here. Works, but a DHT22 would be the upgrade.
+#
+# Humidifier (v5): 5 VDC mist module switched via an IRF520 MOSFET board on
+# GPIO10 (yellow/SIG of the Grove port labelled G10/G11).
+#   BURST LIMITER: in AUTO the humidifier is PULSED, not run continuously. The
+#   box humidifies far faster than the DHT11 registers it, so a plain "on while
+#   RH < low" would overshoot badly. Instead, when RH < humidity_low and the
+#   output is idle, hum_burst runs the mist for hum_burst_s seconds, then forces
+#   it off and starts a hum_rest_s settle window during which the hysteresis
+#   may NOT re-trigger -- the mist disperses and the sensor catches up before
+#   the next decision. A NaN reading forces the humidifier off (dead-sensor
+#   fail-safe). The 15 min on_turn_on cap now only guards a forgotten MANUAL ON
+#   (in AUTO the burst self-terminates long before).
+#
+# Humidity venting (v5.2): the fan now serves TWO masters -- temperature AND
+# humidity. To avoid two controllers fighting over one relay, the fan is owned
+# by a single resolver (resolve_fan), which runs it whenever EITHER the
+# temperature hysteresis (temp_fan_demand, from the climate's cool/idle
+# actions) OR the humidity venting hysteresis (hum_vent) wants it. Venting
+# starts at humidity_vent_high and stops at humidity_vent_stop. The wide gap
+# between humidity_vent_stop (83 %) and humidity_low (78 %) is the anti-
+# oscillation dead zone: after venting stops the box is still well above the
+# humidifier trigger, so it cannot immediately re-humidify and re-vent. In
+# MANUAL the resolver stands down entirely and the user owns the relay.
+#
+# Backlog (v3): every DHT reading is also stored in a RAM ring buffer with a
+# HARD CAP of BACKLOG_CAPACITY samples (statically allocated, ~45 KB -- the
+# memory footprint is fixed at compile time and can never grow). When the
+# Cardputer reconnects it sends CMD_GET_BACKLOG with the last Stamp uptime it
+# knows; the Stamp replays everything newer in MSG_BACKLOG chunks. Older
+# samples beyond the cap are silently overwritten (oldest first). The buffer
+# does not survive a Stamp reboot.
+#
+# BOOT STATE: the system boots in MANUAL with both outputs OFF
+# (restore_mode: ALWAYS_OFF). Nothing regulates until 'a' (CMD_SET_AUTO) is
+# pressed on the Cardputer.
+#
+# Flashing happens over USB (no OTA in pure ESP-NOW mode).
+# Requires protocol.h v5 -- reflash the Cardputer with the SAME protocol.h,
+# the telemetry packet shrank from 17 to 16 bytes (hum_mode removed).
+# =============================================================================
+
+substitutions:
+  # Fixed ESP-NOW channel. The Cardputer MUST use the same value.
+  espnow_channel: "1"
+  # MAC address of the Cardputer -- read it with mac_printer.ino first, then
+  # paste it here (format AA:BB:CC:DD:EE:FF).
+  # NOTE: also keep CARD_MAC inside the CMD_GET_BACKLOG lambda in sync!
+  cardputer_mac: "3C:0F:02:E8:2A:E8"
+
+  # --- Humidity setpoints (target ~80 % RH for cuttings) ---
+  # humidity_low and humidity_vent_high are now only the INITIAL values of the
+  # runtime-adjustable globals g_hum_low / g_vent_high (settable from the
+  # Cardputer's SETTINGS page and persisted in NVS). humidity_vent_stop is no
+  # longer a fixed value -- it is DERIVED at runtime as g_vent_high - vent_hyst,
+  # so the venting hysteresis width stays constant as the threshold moves.
+  humidity_low: "80.0"      # initial g_hum_low: humidifier ON below this (%RH)
+  humidity_high: "83.0"     # informational: upper edge of the target band
+  humidifier_pin: "GPIO10"  # IRF520 gate -> SIG (yellow) of the G10/G11 Grove port
+
+  # --- Humidifier burst limiter (AUTO) ---
+  hum_burst_s: "30"         # max humidifier on-time per burst
+  hum_rest_s:  "60"        # forced settle time after a burst before re-evaluating
+
+  # --- Humidity VENTING (runs the fan to shed moisture) ---
+  # Wide dead zone vs. the humidifier so the two never fight: the fan vents only
+  # well ABOVE the humidifier band, and stops with margin before the humidifier
+  # could re-trigger (vent_stop = g_vent_high - vent_hyst must stay > g_hum_low;
+  # the Cardputer enforces a 10 %RH gap when adjusting these).
+  humidity_vent_high: "95.0"  # initial g_vent_high: fan starts venting at/above (%RH)
+  vent_hyst: "5.0"            # venting stops at g_vent_high - vent_hyst (%RH)
+  vent_delay_s: "120"        # initial g_vent_delay_s: RH must stay above the vent
+                             # threshold this long before venting (0 = immediate).
+                             # Effective resolution is the 30 s DHT interval.
+
+esphome:
+  name: growbox
+  friendly_name: Growbox
+  # Firmware/config version of THIS device. SemVer, independent of the Cardputer
+  # build and of PROTOCOL_VERSION (protocol.h): bump it when growbox.yaml changes.
+  # ESPHome prints "Project rbloechlinger.growbox version 5.4.0" in the boot log.
+  project:
+    name: "rbloechlinger.growbox"
+    version: "5.4.0"
+  # Pull in the shared wire format so the lambdas below can use the enums/structs.
+  includes:
+    - protocol.h
+  on_boot:
+    priority: -100   # end of setup: runs AFTER the climate restored its state
+    then:
+      - lambda: |-
+          // Boot in MANUAL: force the climate (= the single global mode) to
+          // OFF, overriding any AUTO restored from flash. Both outputs stay
+          // OFF (restore_mode: ALWAYS_OFF) until the user presses 'a'.
+          auto call = id(growbox_climate).make_call();
+          call.set_mode(climate::CLIMATE_MODE_OFF);
+          call.perform();
+          id(hum_lockout_ms) = 0;
+          ESP_LOGI("growbox", "Boot: MANUAL mode (fan + humidifier off)");
+
+esp32:
+  board: m5stack-stamps3
+  framework:
+    type: esp-idf
+
+# Logs over native USB (no network logging without WiFi).
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+
+# ----------------------------------------------------------------------------
+# Burst-limiter settle clock. millis() until which AUTO must NOT re-trigger a
+# humidifier burst. A plain uint32_t is fine in ESPHome's globals: block (only
+# custom types like BacklogStore must live in protocol.h instead, because the
+# globals declarations are emitted before the user includes).
+# ----------------------------------------------------------------------------
+globals:
+  - id: hum_lockout_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  # --- Fan demand flags: resolve_fan ORs these into the single relay state ---
+  - id: temp_fan_demand     # set by the climate cool/idle actions (temperature)
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: hum_vent            # set by the humidity venting hysteresis (too humid)
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # --- Runtime-adjustable humidity setpoints (Cardputer SETTINGS page) --------
+  # These replace the former humidity_low / humidity_vent_high substitutions so
+  # the thresholds can change at runtime AND survive a reboot (restore_value:
+  # yes -> stored in NVS). This closes the "no setpoint persistence" TODO for the
+  # humidity side. (The temperature target still lives in the climate component.)
+  - id: g_hum_low           # humidify-below threshold (%RH)
+    type: float
+    restore_value: yes
+    initial_value: '${humidity_low}'
+  - id: g_vent_high         # venting-above threshold (%RH); vent_stop trails by vent_hyst
+    type: float
+    restore_value: yes
+    initial_value: '${humidity_vent_high}'
+  - id: g_vent_delay_s      # how long RH must stay above g_vent_high before venting
+    type: uint32_t
+    restore_value: yes
+    initial_value: '${vent_delay_s}'
+  # Dwell clock for the vent on-delay: millis() since RH first went over
+  # g_vent_high in the current over-threshold episode; 0 = not currently over.
+  # Not persisted (a reboot starts the episode fresh).
+  - id: hum_over_since_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+# ----------------------------------------------------------------------------
+# Pure ESP-NOW: no wifi/ota/web_server. Fixed channel, Cardputer as peer.
+# (The backlog ring buffer lives in protocol.h via backlogStore() -- ESPHome's
+#  globals: block can't hold custom types because its declarations are emitted
+#  before the user includes.)
+# ----------------------------------------------------------------------------
+espnow:
+  channel: ${espnow_channel}
+  peers:
+    - ${cardputer_mac}
+  on_receive:
+    - lambda: |-
+        // Expect a CommandMsg: [0x02][command][float value]
+        if (size < 6 || data[0] != MSG_COMMAND) return;
+        uint8_t command = data[1];
+        float value;
+        memcpy(&value, data + 2, sizeof(float));
+        switch (command) {
+          case CMD_SET_TARGET: {
+            // value = fan ON threshold (target_high); the OFF threshold
+            // (target_low) trails by the dead band.
+            const float DEAD_BAND = 4.0f;   // keep in sync with config.h on the Cardputer
+            auto call = id(growbox_climate).make_call();
+            call.set_target_temperature_high(value);
+            call.set_target_temperature_low(value - DEAD_BAND);
+            call.perform();
+            ESP_LOGI("growbox", "Target: ON >= %.1f C, OFF <= %.1f C",
+                     value, value - DEAD_BAND);
+            break;
+          }
+          case CMD_SET_TARGET_RH: {
+            // Humidify-below threshold (%RH). The Cardputer already keeps a
+            // 10 %RH gap to the venting threshold; clamp defensively here so a
+            // stray value can never push it to/above vent_stop (= g_vent_high -
+            // vent_hyst), which would collapse the anti-oscillation dead zone.
+            float v = value;
+            float hi = id(g_vent_high) - ${vent_hyst}f;   // = vent_stop
+            if (v < 30.0f) v = 30.0f;
+            if (v > hi)    v = hi;
+            id(g_hum_low) = v;
+            ESP_LOGI("growbox", "Humidify below: %.0f %% RH", v);
+            break;
+          }
+          case CMD_SET_VENT_RH: {
+            // Venting-above threshold (%RH). Must stay at least vent_hyst above
+            // g_hum_low so the derived vent_stop never drops onto the humidifier
+            // trigger. Venting starts here, stops at v - vent_hyst.
+            float v = value;
+            float lo = id(g_hum_low) + ${vent_hyst}f;
+            if (v < lo)    v = lo;
+            if (v > 99.0f) v = 99.0f;
+            id(g_vent_high) = v;
+            ESP_LOGI("growbox", "Vent above: %.0f %% RH (stop at %.0f)",
+                     v, v - ${vent_hyst}f);
+            break;
+          }
+          case CMD_SET_VENT_DELAY: {
+            // Vent on-delay (seconds). RH must stay above g_vent_high this long
+            // before the fan vents -- rides out post-burst overshoot + DHT11
+            // noise. Effective resolution is the 30 s DHT interval. 0 = vent
+            // immediately. Reset the dwell clock so the new value takes effect
+            // from the next reading rather than crediting time already elapsed.
+            uint32_t s = (value < 0.0f) ? 0u : (uint32_t) value;
+            if (s > 600u) s = 600u;
+            id(g_vent_delay_s)   = s;
+            id(hum_over_since_ms) = 0;
+            ESP_LOGI("growbox", "Vent delay: %lu s", (unsigned long) s);
+            break;
+          }
+          case CMD_TOGGLE_VENT: {
+            // Manual fan toggle -> drops the whole system into MANUAL (both
+            // automations are gated on the climate mode, so they stand down,
+            // and resolve_fan no longer touches the relay). The humidifier
+            // keeps its current state; a running burst self-terminates.
+            // Since the mode switch no longer moves the relay (resolve_fan is
+            // inert in MANUAL), we simply read the current state and invert it.
+            bool was_on = id(fan_relay).state;
+            if (id(growbox_climate).mode != climate::CLIMATE_MODE_OFF) {
+              auto call = id(growbox_climate).make_call();
+              call.set_mode(climate::CLIMATE_MODE_OFF);
+              call.perform();
+              ESP_LOGI("growbox", "Mode: MANUAL");
+            }
+            if (was_on) id(fan_relay).turn_off();
+            else        id(fan_relay).turn_on();
+            ESP_LOGI("growbox", "Fan (manual): %s", was_on ? "OFF" : "ON");
+            break;
+          }
+          case CMD_TOGGLE_HUM: {
+            // Manual humidifier toggle -> ALSO drops the whole system into
+            // MANUAL. With resolve_fan as the relay owner the mode switch no
+            // longer moves the fan, so the capture/restore below is now purely
+            // defensive (a no-op in practice) -- kept so a humidifier toggle
+            // provably never disturbs the fan. Order matters: enter MANUAL
+            // first so the humidifier turn_on below arms the 15 min cap.
+            bool fan_was = id(fan_relay).state;
+            if (id(growbox_climate).mode != climate::CLIMATE_MODE_OFF) {
+              auto call = id(growbox_climate).make_call();
+              call.set_mode(climate::CLIMATE_MODE_OFF);
+              call.perform();
+              ESP_LOGI("growbox", "Mode: MANUAL");
+            }
+            if (fan_was) id(fan_relay).turn_on();   // restore fan unchanged
+            else         id(fan_relay).turn_off();
+            bool hum_was = id(humidifier).state;
+            if (hum_was) id(humidifier).turn_off();
+            else         id(humidifier).turn_on();
+            ESP_LOGI("growbox", "Humidifier (manual): %s", hum_was ? "OFF" : "ON");
+            break;
+          }
+          case CMD_SET_AUTO: {
+            // Hand control of BOTH outputs back to the automation.
+            //
+            // Fan: resolve_fan owns the relay now, so reset both demands first.
+            // set_mode(COOL) re-fires cool_action when the box is hot (re-arming
+            // temp_fan_demand), but the OFF->IDLE transition is "visual only"
+            // and does NOT fire idle_action -- which is exactly why we must
+            // clear temp_fan_demand explicitly here rather than rely on it.
+            id(temp_fan_demand) = false;
+            id(hum_vent)        = false;
+            auto call = id(growbox_climate).make_call();
+            call.set_mode(climate::CLIMATE_MODE_COOL);
+            call.perform();
+            // Humidifier + venting: clear any leftover settle lockout and
+            // re-evaluate immediately from the last reading instead of waiting
+            // up to 30 s for the next DHT cycle. Too humid -> arm venting; too
+            // dry -> kick off a fresh burst; inside the band -> settle on OFF.
+            id(hum_lockout_ms) = 0;
+            float h = id(growbox_hum).state;
+            if (isnan(h)) {
+              id(humidifier).turn_off();        // fail-safe: sensor dead
+              id(hum_over_since_ms) = 0;
+            } else if (h >= id(g_vent_high)) {
+              // already over the cap: arm the dwell clock instead of venting
+              // immediately, so the on-delay applies straight after AUTO too.
+              id(hum_over_since_ms) = millis();
+              id(humidifier).turn_off();
+            } else if (h < id(g_hum_low)) {
+              id(hum_burst)->execute();         // dry -> pulse, not continuous
+              id(hum_over_since_ms) = 0;
+            } else {
+              id(humidifier).turn_off();
+              id(hum_over_since_ms) = 0;
+            }
+            id(resolve_fan).execute();          // apply the freshly armed demands
+            ESP_LOGI("growbox", "Mode: AUTO (fan + humidifier)");
+            break;
+          }
+          case CMD_GET_BACKLOG: {
+            // Keep in sync with the cardputer_mac substitution above.
+            static const uint8_t CARD_MAC[6] = {0x3C, 0x0F, 0x02, 0xE8, 0x2A, 0xE8};
+            uint32_t since = (uint32_t) value;
+            auto &bl = backlogStore();
+            uint8_t pkt[4 + BACKLOG_MAX_PER_PKT * sizeof(BacklogSample)];
+            uint8_t n = 0;
+            uint16_t sent = 0;
+            for (uint16_t i = 0; i < bl.count; i++) {
+              uint16_t idx = (uint16_t)((bl.head + BACKLOG_CAPACITY - bl.count + i)
+                                        % BACKLOG_CAPACITY);
+              const BacklogSample &s = bl.buf[idx];
+              if (s.t_s <= since) continue;
+              memcpy(&pkt[4 + n * sizeof(BacklogSample)], &s, sizeof(BacklogSample));
+              n++;
+              if (n == BACKLOG_MAX_PER_PKT) {
+                pkt[0] = MSG_BACKLOG; pkt[1] = n; pkt[2] = 0; pkt[3] = 0;
+                size_t len = 4 + (size_t) n * sizeof(BacklogSample);
+                for (int r = 0; r < 5 && esp_now_send(CARD_MAC, pkt, len) != ESP_OK; r++)
+                  delay(5);   // ESP-NOW TX queue full -> brief backoff
+                sent += n; n = 0;
+                delay(3);     // pace the chunks so the Cardputer can keep up
+              }
+            }
+            if (n > 0) {
+              pkt[0] = MSG_BACKLOG; pkt[1] = n; pkt[2] = 0; pkt[3] = 0;
+              size_t len = 4 + (size_t) n * sizeof(BacklogSample);
+              for (int r = 0; r < 5 && esp_now_send(CARD_MAC, pkt, len) != ESP_OK; r++)
+                delay(5);
+              sent += n;
+              delay(3);
+            }
+            // end-of-transfer marker (empty chunk)
+            pkt[0] = MSG_BACKLOG; pkt[1] = 0; pkt[2] = 0; pkt[3] = 0;
+            esp_now_send(CARD_MAC, pkt, 4);
+            ESP_LOGI("growbox", "Backlog: %u samples sent (since %lus)",
+                     sent, (unsigned long) since);
+            break;
+          }
+          case CMD_REFRESH: {
+            // On-demand DHT read so the live values jump instead of waiting up
+            // to 30 s for the next poll. ESPHome's DHT update() is SYNCHRONOUS:
+            // it does the bitbang read inline and publishes immediately, which
+            // fires the temperature/humidity on_value handlers below -- and
+            // those already call send_telemetry with the FRESH values. So we
+            // return here to skip the trailing (now redundant) cached send; the
+            // Cardputer has already seen the new reading. A failed read
+            // publishes NaN and still emits a frame (display blanks briefly),
+            // which is the honest state. Blocking ~25 ms in this handler is
+            // fine -- it runs in the main loop (CMD_GET_BACKLOG above already
+            // delay()s in here far longer).
+            id(growbox_dht).update();
+            ESP_LOGI("growbox", "Manual DHT refresh");
+            return;
+          }
+          default:
+            ESP_LOGW("growbox", "Unknown command 0x%02X", command);
+            return;
+        }
+        // Instant feedback to the Cardputer: report the new fan/humidifier/
+        // mode state right away instead of waiting for the next DHT cycle.
+        id(send_telemetry).execute();
+
+# ----------------------------------------------------------------------------
+# Telemetry sender -- single source of truth for the live wire format (v5).
+# Called after every DHT reading and after every executed command.
+# ----------------------------------------------------------------------------
+script:
+  - id: send_telemetry
+    mode: restart
+    then:
+      - espnow.send:
+          address: ${cardputer_mac}
+          wait_for_sent: false
+          data: !lambda |-
+            TelemetryMsg m;
+            m.type        = MSG_TELEMETRY;
+            m.temperature = id(growbox_temp).state;
+            m.humidity    = id(growbox_hum).state;
+            m.fan_on      = id(fan_relay).state ? 1 : 0;
+            m.mode        = (id(growbox_climate).mode == climate::CLIMATE_MODE_OFF)
+                              ? MODE_MANUAL : MODE_AUTO;
+            m.hum_on      = id(humidifier).state ? 1 : 0;
+            m.uptime_s    = millis() / 1000UL;
+            std::vector<uint8_t> pkt(sizeof(TelemetryMsg));
+            memcpy(pkt.data(), &m, sizeof(m));
+            return pkt;
+
+  # --------------------------------------------------------------------------
+  # Humidifier burst: ONE self-terminating mist pulse. Runs the output for
+  # hum_burst_s, forces it off, then opens a hum_rest_s settle window during
+  # which the AUTO hysteresis (humidity on_value below) refuses to re-trigger.
+  # mode: single -> a burst already in progress ignores re-requests.
+  # --------------------------------------------------------------------------
+  - id: hum_burst
+    mode: single
+    then:
+      - switch.turn_on: humidifier
+      - delay: ${hum_burst_s}s
+      - switch.turn_off: humidifier
+      - lambda: 'id(hum_lockout_ms) = millis() + ${hum_rest_s} * 1000UL;'
+
+  # --------------------------------------------------------------------------
+  # Single owner of the fan relay in AUTO. The fan runs if EITHER the
+  # temperature hysteresis (temp_fan_demand, driven by the climate's cool/idle
+  # actions) OR the humidity venting hysteresis (hum_vent) wants it -- a plain
+  # OR of the two demands. In MANUAL the climate is OFF and the user owns the
+  # relay, so we stand down and never touch it. The state guard avoids
+  # redundant switch calls (and the telemetry churn they would trigger).
+  # --------------------------------------------------------------------------
+  - id: resolve_fan
+    then:
+      - lambda: |-
+          if (id(growbox_climate).mode == climate::CLIMATE_MODE_OFF) return;  // MANUAL
+          bool want = id(temp_fan_demand) || id(hum_vent);
+          if (want != id(fan_relay).state) {
+            if (want) id(fan_relay).turn_on();
+            else      id(fan_relay).turn_off();
+          }
+
+sensor:
+  - platform: dht
+    id: growbox_dht       # lets CMD_REFRESH force an out-of-cycle read
+    pin: GPIO1
+    model: DHT11          # change to DHT22 if it's the white "Pro" sensor
+    temperature:
+      name: "Temperature"
+      id: growbox_temp
+      on_value:
+        # 1) store the reading in the hard-capped RAM backlog
+        - lambda: |-
+            auto &bl = backlogStore();
+            BacklogSample s;
+            s.t_s = millis() / 1000UL;
+            s.temp_c10 = (int16_t) lroundf(x * 10.0f);
+            float h = id(growbox_hum).state;
+            s.hum = isnan(h) ? HUM_INVALID : (uint8_t) lroundf(h);
+            s.flags = (id(fan_relay).state ? FLAG_FAN : 0)
+                    | ((id(growbox_climate).mode != climate::CLIMATE_MODE_OFF)
+                         ? FLAG_AUTO : 0)
+                    | (id(humidifier).state ? FLAG_HUM : 0);
+            bl.buf[bl.head] = s;
+            bl.head = (uint16_t)((bl.head + 1) % BACKLOG_CAPACITY);
+            if (bl.count < BACKLOG_CAPACITY) bl.count++;
+        # 2) fire-and-forget live telemetry
+        - script.execute: send_telemetry
+    humidity:
+      name: "Humidity"
+      id: growbox_hum
+      on_value:
+        # Humidity control (AUTO only). The climate mode is the single global
+        # mode: OFF means MANUAL, so the user owns the outputs and we stand
+        # down. Two independent jobs share this reading:
+        #   1) VENTING: too humid -> run the fan (via hum_vent + resolve_fan)
+        #      with hysteresis (start at vent_high, stop at vent_stop).
+        #   2) HUMIDIFYING: too dry -> one self-terminating mist burst, gated by
+        #      the post-burst settle lockout.
+        # The thresholds keep these mutually exclusive (vent_high >> humidity_low),
+        # and the hum_vent guard makes that explicit: never humidify while
+        # venting. A NaN reading forces BOTH outputs to a safe state.
+        - lambda: |-
+            if (id(growbox_climate).mode == climate::CLIMATE_MODE_OFF) return;  // MANUAL
+            if (isnan(x)) {                                  // fail-safe
+              id(humidifier).turn_off();
+              id(hum_vent) = false;                          // stop venting too
+              id(resolve_fan).execute();
+              return;
+            }
+            // 1) venting hysteresis with an on-delay -> fan demand.
+            //    Start venting only once RH has stayed above g_vent_high for
+            //    g_vent_delay_s; a dip back below resets the dwell clock. Stop
+            //    is immediate at vent_stop (no off-delay). This rides out the
+            //    post-burst overshoot and DHT11 noise instead of venting on
+            //    every brief spike. NOTE: re-evaluated only every 30 s (the DHT
+            //    interval), so the delay resolves in 30 s steps.
+            if (!id(hum_vent)) {
+              if (x >= id(g_vent_high)) {
+                if (id(hum_over_since_ms) == 0) id(hum_over_since_ms) = millis();
+                if (millis() - id(hum_over_since_ms)
+                      >= id(g_vent_delay_s) * 1000UL) {
+                  id(hum_vent) = true;
+                }
+              } else {
+                id(hum_over_since_ms) = 0;          // dropped below -> reset
+              }
+            } else if (x <= id(g_vent_high) - ${vent_hyst}f) {
+              id(hum_vent) = false;
+              id(hum_over_since_ms) = 0;
+            }
+            id(resolve_fan).execute();
+            // 2) humidifier burst -- never while venting, never during settle
+            if (id(hum_vent)) return;
+            if ((int32_t) (id(hum_lockout_ms) - millis()) > 0) return;  // settling
+            if (x < id(g_hum_low) && !id(humidifier).state) {
+              id(hum_burst)->execute();
+            }
+        # Telemetry again so a humidifier/fan state change shows up immediately
+        # (the temperature on_value above may have fired before this one).
+        - script.execute: send_telemetry
+    update_interval: 30s
+
+# --- Fan relay on Grove3, signal pin G6 ---
+switch:
+  - platform: gpio
+    pin: GPIO6
+    id: fan_relay
+    name: "Fan Relay"
+    restore_mode: ALWAYS_OFF   # safety: fan off after boot/brownout
+  - platform: gpio
+    pin: ${humidifier_pin}
+    id: humidifier
+    name: "Humidifier"
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      # In AUTO the hum_burst script owns the on-time (60 s pulses), so this
+      # 15 min cap is only the dry-run safety for a forgotten MANUAL ON.
+      - if:
+          condition:
+            lambda: 'return id(growbox_climate).mode == climate::CLIMATE_MODE_OFF;'
+          then:
+            - delay: 15min
+            - switch.turn_off: humidifier
+
+# --- Hysteresis climate control for the fan (active in AUTO mode only) ---
+# This component's mode is ALSO the single global mode: COOL = AUTO, OFF = MANUAL.
+climate:
+  - platform: bang_bang
+    id: growbox_climate
+    name: "Growbox Cooling"
+    sensor: growbox_temp                     # must match the id of your DHT temperature sensor
+    default_target_temperature_low: 24 °C    # fan OFF below this (28 - DEAD_BAND)
+    default_target_temperature_high: 28 °C   # fan ON above this (cuttings target)
+    cool_action:
+      # The climate no longer drives the relay directly -- it only reports the
+      # temperature demand; resolve_fan ORs it with the venting demand.
+      - lambda: 'id(temp_fan_demand) = true;'
+      - script.execute: resolve_fan
+    idle_action:
+      - lambda: 'id(temp_fan_demand) = false;'
+      - script.execute: resolve_fan
+    visual:
+      min_temperature: 18
+      max_temperature: 35
+      temperature_step: 0.5
