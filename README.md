@@ -99,15 +99,16 @@ Erstmalige MAC-Ermittlung:
 
 ## Bedienung (Cardputer-Tasten)
 
-| Taste | Funktion |
-|---|---|
-| `w` / `s` | Zieltemperatur ±0,5 °C (AUTO-Schwelle) |
-| `SPACE` | Lüfter manuell umschalten → wechselt in MANUAL |
-| `h` | Befeuchter manuell umschalten → wechselt in MANUAL |
-| `a` | zurück zu AUTO (Lüfter **und** Befeuchter) |
-| `r` | manueller Sensor-Refresh (außerplanmäßiges DHT-Reading) |
-| `,` / `/` | Seite zurück / vor |
-| `;` / `.` | nur History-Seite: ältere / neuere Session |
+| Taste     | Funktion                                                |
+|-----------|---------------------------------------------------------|
+| `w` / `s` | Zieltemperatur ±0,5 °C (AUTO-Schwelle)                  |
+| `SPACE`   | Lüfter manuell umschalten → wechselt in MANUAL          |
+| `h`       | Befeuchter manuell umschalten → wechselt in MANUAL      |
+| `a`       | zurück zu AUTO (Lüfter **und** Befeuchter)              |
+| `r`       | manueller Sensor-Refresh (außerplanmäßiges DHT-Reading) |
+| `v`       | Seite vor                                               |
+| `,` / `/` | Wert hoch / Wert runter                                 |
+| `;` / `.` | nur History-Seite: ältere / neuere Session              |
 
 ### Seiten
 

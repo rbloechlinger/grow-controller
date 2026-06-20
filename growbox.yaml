@@ -107,9 +107,9 @@ substitutions:
   # the Cardputer enforces a 10 %RH gap when adjusting these).
   humidity_vent_high: "95.0"  # initial g_vent_high: fan starts venting at/above (%RH)
   vent_hyst: "5.0"            # venting stops at g_vent_high - vent_hyst (%RH)
-  vent_delay_s: "120"        # initial g_vent_delay_s: RH must stay above the vent
-                             # threshold this long before venting (0 = immediate).
-                             # Effective resolution is the 30 s DHT interval.
+  vent_delay_s: "300"        # initial g_vent_delay_s: RH must stay above the vent
+    # threshold this long before venting (0 = immediate).
+  # Effective resolution is the 30 s DHT interval.
 
 esphome:
   name: growbox
@@ -119,7 +119,7 @@ esphome:
   # ESPHome prints "Project rbloechlinger.growbox version 5.4.0" in the boot log.
   project:
     name: "rbloechlinger.growbox"
-    version: "5.4.0"
+    version: "6.2.0"
   # Pull in the shared wire format so the lambdas below can use the enums/structs.
   includes:
     - protocol.h
@@ -189,6 +189,19 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: '0'
+  # --- Local manual control state (M5 Dual Button) ---
+  - id: g_sel                 # selected manual mode: 1=humidify(I) 2=vent(II) 3=both(III)
+    type: uint8_t
+    restore_value: no
+    initial_value: '1'
+  - id: g_latch               # true = selected mode latched ON (red double-click)
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: g_combo               # true while a "both buttons" combo is latched
+    type: bool
+    restore_value: no
+    initial_value: 'false'
 
 # ----------------------------------------------------------------------------
 # Pure ESP-NOW: no wifi/ota/web_server. Fixed channel, Cardputer as peer.
@@ -377,20 +390,20 @@ espnow:
                      sent, (unsigned long) since);
             break;
           }
+          case CMD_HELLO:
           case CMD_REFRESH: {
-            // On-demand DHT read so the live values jump instead of waiting up
-            // to 30 s for the next poll. ESPHome's DHT update() is SYNCHRONOUS:
-            // it does the bitbang read inline and publishes immediately, which
-            // fires the temperature/humidity on_value handlers below -- and
-            // those already call send_telemetry with the FRESH values. So we
-            // return here to skip the trailing (now redundant) cached send; the
-            // Cardputer has already seen the new reading. A failed read
-            // publishes NaN and still emits a frame (display blanks briefly),
-            // which is the honest state. Blocking ~25 ms in this handler is
-            // fine -- it runs in the main loop (CMD_GET_BACKLOG above already
-            // delay()s in here far longer).
+            // CMD_HELLO: Cardputer (re)booted and announced itself on link-up.
+            // CMD_REFRESH: user asked for a manual read. Both force a SYNCHRONOUS
+            // out-of-cycle DHT read; ESPHome publishes inline, firing the
+            // on_value handlers -> they call send_telemetry with the FRESH
+            // reading AND (v6) the live setpoints, so the Cardputer's display and
+            // SETTINGS page are correct in one shot. We return to skip the
+            // trailing cached send. A failed read publishes NaN and still emits a
+            // frame carrying the setpoints -- the honest state, sync still happens.
             id(growbox_dht).update();
-            ESP_LOGI("growbox", "Manual DHT refresh");
+            ESP_LOGI("growbox", command == CMD_HELLO
+                       ? "Cardputer hello: fresh read + setpoint echo"
+                       : "Manual DHT refresh");
             return;
           }
           default:
@@ -422,6 +435,10 @@ script:
                               ? MODE_MANUAL : MODE_AUTO;
             m.hum_on      = id(humidifier).state ? 1 : 0;
             m.uptime_s    = millis() / 1000UL;
+            m.target_temp  = id(growbox_climate).target_temperature_high;
+            m.hum_low      = id(g_hum_low);
+            m.vent_high    = id(g_vent_high);
+            m.vent_delay_s = (uint16_t) id(g_vent_delay_s);
             std::vector<uint8_t> pkt(sizeof(TelemetryMsg));
             memcpy(pkt.data(), &m, sizeof(m));
             return pkt;
@@ -457,6 +474,52 @@ script:
             if (want) id(fan_relay).turn_on();
             else      id(fan_relay).turn_off();
           }
+
+  # Drive the relays for the selected manual mode. Only acts in MANUAL;
+  # AUTO keeps ownership of the outputs via resolve_fan / the hysteresis.
+  - id: apply_manual
+    then:
+      - lambda: |-
+          if (id(growbox_climate).mode != climate::CLIMATE_MODE_OFF) return;
+          bool active   = id(g_latch) || id(btn_red).state;
+          bool want_hum = active && (id(g_sel) == 1 || id(g_sel) == 3);
+          bool want_fan = active && (id(g_sel) == 2 || id(g_sel) == 3);
+          if (want_hum) id(humidifier).turn_on(); else id(humidifier).turn_off();
+          if (want_fan) id(fan_relay).turn_on();  else id(fan_relay).turn_off();
+
+  # Back to AUTO: clear the manual latch, re-arm both automations and
+  # re-evaluate humidity immediately (identical to the CMD_SET_AUTO handler).
+  - id: enter_auto
+    then:
+      - lambda: |-
+          id(g_latch) = false;
+          id(temp_fan_demand) = false;
+          id(hum_vent)        = false;
+
+          auto call = id(growbox_climate).make_call();
+          call.set_mode(climate::CLIMATE_MODE_COOL);
+          call.perform();
+
+          id(hum_lockout_ms) = 0;
+
+          float h = id(growbox_hum).state;
+          if (isnan(h)) {
+            id(humidifier).turn_off();
+            id(hum_over_since_ms) = 0;
+          } else if (h >= id(g_vent_high)) {
+            id(hum_over_since_ms) = millis();
+            id(humidifier).turn_off();
+          } else if (h < id(g_hum_low)) {
+            id(hum_burst)->execute();
+            id(hum_over_since_ms) = 0;
+          } else {
+            id(humidifier).turn_off();
+            id(hum_over_since_ms) = 0;
+          }
+
+          id(resolve_fan).execute();
+          ESP_LOGI("growbox", "Mode: AUTO (buttons)");
+      - script.execute: send_telemetry
 
 sensor:
   - platform: dht
@@ -582,3 +645,173 @@ climate:
       min_temperature: 18
       max_temperature: 35
       temperature_step: 0.5
+
+# ============================================================================
+# Local HMI on the Stamp: SH1107 128x64 OLED (Grove6) + M5 Dual Button (Grove5)
+# Layout C: big humidity number + linear bar (60..100 %) with target/vent marks.
+# Controls:
+#   BLUE  click      -> cycle manual mode  I=humidify  II=vent  III=both
+#   RED   hold       -> run selected mode while held
+#   RED   doubleclick-> latch selected mode ON (red press stops it again)
+#   BOTH             -> back to AUTO (regulated)
+# Display shows AUTO / I / II / III (left) and the live status / LOCK (right).
+# ============================================================================
+i2c:
+  sda: GPIO13        # Grove6 IO1 (SDA/SCL swapped vs. silk to get an ACK)
+  scl: GPIO15        # Grove6 IO2
+  frequency: 400kHz
+  scan: false
+
+font:
+  - file: "gfonts://Roboto@700"
+    id: font_huge
+    size: 32
+    glyphs: "0123456789-"
+  - file: "gfonts://Roboto@500"
+    id: font_small
+    size: 11
+    glyphs: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ %.:-°"
+
+display:
+  - platform: ssd1306_i2c
+    model: "SH1107 128x128" # M5 unit uses the full 128x128 RAM; the "128x64" model only drives half the segments
+    address: 0x3C           # try 0x3D if the i2c scan finds nothing
+    id: oled
+    update_interval: 250ms # runs in the main loop, NOT in the ESP-NOW RX callback -> it cannot starve the radio
+    rotation: 90
+    offset_y: 32
+    lambda: |-
+      auto &d = it;
+
+      // ---- inputs ----
+      const float rh = id(growbox_hum).state;
+      const float tc = id(growbox_temp).state;
+      const bool  auto_mode = id(growbox_climate).mode != climate::CLIMATE_MODE_OFF;
+      const bool  fan = id(fan_relay).state;
+      const bool  hum = id(humidifier).state;
+      const bool  rh_nan = isnan(rh);
+
+      // ---- top row: mode (left) + status / lock (right) ----
+      const char *mode = auto_mode      ? "AUTO"
+                       : id(g_sel) == 1 ? "I"
+                       : id(g_sel) == 2 ? "II"
+                       :                  "III";
+      d.printf(0, 0, id(font_small), "%s", mode);
+
+      const char *status = id(g_latch)   ? "LOCK"
+                         : (hum && fan)  ? "BOTH"
+                         : hum           ? "HUM"
+                         : fan           ? "VENT"
+                         : auto_mode     ? "IDLE"
+                         :                 "OFF";
+      d.printf(127, 0, id(font_small), TextAlign::TOP_RIGHT, "%s", status);
+
+      // ---- hero humidity ----
+      if (rh_nan) d.printf(2, 10, id(font_huge), "--");
+      else        d.printf(2, 10, id(font_huge), "%.0f", rh);
+      d.printf(42, 30, id(font_small), "%%");          // small percent (nudge x if it collides)
+
+      // ---- secondary readouts (right) ----
+      if (!isnan(tc)) d.printf(80, 14, id(font_small), "%.1f°C", tc);
+      d.printf(80, 27, id(font_small), "TGT %.0f", id(g_hum_low));
+
+      // ---- humidity bar: 60..100 %, with target + vent marks ----
+      const int bx = 4, by = 53, bw = 120, bh = 9;
+      auto frac = [](float v) -> float { float f = (v - 60.0f) / 40.0f; return f < 0 ? 0.0f : (f > 1 ? 1.0f : f); };
+      if (!rh_nan) d.filled_rectangle(bx, by, (int) (bw * frac(rh)), bh);   // fill to current RH
+      d.rectangle(bx, by, bw, bh);                                         // frame
+      int tx = bx + (int) (bw * frac(id(g_hum_low)));                      // target mark (bold)
+      d.line(tx, by - 4, tx, by + bh + 3);
+      d.line(tx + 1, by - 4, tx + 1, by + bh + 3);
+      int vx = bx + (int) (bw * frac(id(g_vent_high)));                    // vent mark (thin)
+      d.line(vx, by - 2, vx, by + bh + 1);
+
+binary_sensor:
+  # BLUE: click cycles the manual mode (I -> II -> III). Both buttons -> AUTO.
+  - platform: gpio
+    id: btn_blue
+    pin:
+      number: GPIO9
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on: 20ms
+    on_press:
+      - lambda: |-
+          if (id(btn_red).state) {                 // both held -> AUTO
+            id(g_combo) = true;
+            id(enter_auto).execute();
+            return;
+          }
+          if (id(g_combo)) return;
+          if (id(growbox_climate).mode != climate::CLIMATE_MODE_OFF) {
+            auto call = id(growbox_climate).make_call();   // enter MANUAL at mode I
+            call.set_mode(climate::CLIMATE_MODE_OFF);
+            call.perform();
+            id(g_sel) = 1;
+          } else {
+            id(g_sel) = id(g_sel) % 3 + 1;               // cycle I -> II -> III -> I
+          }
+          id(apply_manual).execute();
+          id(send_telemetry).execute();
+    on_release:
+      - lambda: |-
+          if (id(g_combo) && !id(btn_blue).state && !id(btn_red).state) id(g_combo) = false;
+
+  # RED: hold = run; double-click = latch; press while latched = stop. Both -> AUTO.
+  - platform: gpio
+    id: btn_red
+    pin:
+      number: GPIO7
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on: 20ms
+    on_press:
+      - lambda: |-
+          if (id(btn_blue).state) {                // both held -> AUTO
+            id(g_combo) = true;
+            id(enter_auto).execute();
+            return;
+          }
+          if (id(g_combo)) return;
+          if (id(g_latch)) {                       // latched -> any red press stops it
+            id(g_latch) = false;
+            id(apply_manual).execute();
+            id(send_telemetry).execute();
+            return;
+          }
+          if (id(growbox_climate).mode != climate::CLIMATE_MODE_OFF) {
+            auto call = id(growbox_climate).make_call();   // jog needs MANUAL
+            call.set_mode(climate::CLIMATE_MODE_OFF);
+            call.perform();
+          }
+          id(apply_manual).execute();              // run selected mode while held
+          id(send_telemetry).execute();
+    on_release:
+      - lambda: |-
+          if (id(g_combo)) {
+            if (!id(btn_blue).state && !id(btn_red).state) id(g_combo) = false;
+            return;
+          }
+          if (id(g_latch)) return;                 // latched -> release does nothing
+          id(apply_manual).execute();              // momentary stop
+          id(send_telemetry).execute();
+    on_double_click:
+      min_length: 50ms
+      max_length: 350ms
+      then:
+        - lambda: |-
+            if (id(g_combo)) return;
+            if (id(growbox_climate).mode != climate::CLIMATE_MODE_OFF) {
+              auto call = id(growbox_climate).make_call();
+              call.set_mode(climate::CLIMATE_MODE_OFF);
+              call.perform();
+            }
+            id(g_latch) = true;                    // latch the selected mode ON
+            id(apply_manual).execute();
+            id(send_telemetry).execute();

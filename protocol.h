@@ -5,6 +5,23 @@
  *   - the ESPHome folder next to growbox.yaml (Stamp S3)
  *   - cardputer/include/ in the Cardputer PlatformIO project
  *
+ * v6 changes (setpoint echo + startup handshake):
+ *   - TelemetryMsg now carries the live setpoints (target_temp, hum_low,
+ *     vent_high, vent_delay_s). The Stamp is the single source of truth for
+ *     these, so echoing them in every frame keeps the Cardputer's display and
+ *     SETTINGS page correct -- it self-heals after a Cardputer reboot instead
+ *     of drifting until the user nudges a value. The packet grew 16 -> 30
+ *     bytes: this is an INCOMPATIBLE wire change, so PROTOCOL_VERSION bumps to
+ *     6 and BOTH devices must be reflashed (mixed versions silently drop each
+ *     other's frames).
+ *   - new command CMD_HELLO: the Cardputer announces itself on link-up so the
+ *     Stamp forces an out-of-cycle DHT read and replies with a fresh frame
+ *     (incl. the setpoints) at once, instead of waiting up to 30 s for the next
+ *     poll. Functionally it is CMD_REFRESH with startup semantics; the Stamp
+ *     handles both in one case.
+ *
+ * v5.5 changes (vent on-delay): set vent on-delay to 300
+ *
  * v5.4 changes (vent on-delay): new command CMD_SET_VENT_DELAY sets how long RH
  *   must stay above the venting threshold before the fan starts venting -- rides
  *   out post-burst overshoot and DHT11 noise. Wire structs UNCHANGED (backward
@@ -41,13 +58,13 @@
 #include <stdint.h>
 
 // ---- Wire-compatibility version --------------------------------------------
-// Bump ONLY when the on-wire structs change incompatibly (as v5 did: the
-// telemetry packet shrank 17 -> 16 bytes). A pure feature add that leaves the
-// structs untouched (new command IDs like v5.1/v5.3/v5.4) does NOT bump this --
-// those ride along on unchanged frames and are tracked by the per-device
-// firmware versions instead. Identical PROTOCOL_VERSION on both ends therefore
-// means "the frames line up"; a mismatch means reflash both.
-#define PROTOCOL_VERSION 5
+// Bump ONLY when the on-wire structs change incompatibly (as v5 did: 17 -> 16
+// bytes; as v6 does: 16 -> 30 bytes). A pure feature add that leaves the structs
+// untouched (new command IDs like v5.1/v5.3/v5.4) does NOT bump this -- those
+// ride along on unchanged frames and are tracked by the per-device firmware
+// versions instead. Identical PROTOCOL_VERSION on both ends therefore means
+// "the frames line up"; a mismatch means reflash both.
+#define PROTOCOL_VERSION 6
 
 // ---- Message types (first byte on the wire) --------------------------------
 static const uint8_t MSG_TELEMETRY = 0x01;  // Stamp -> Cardputer (live)
@@ -55,26 +72,27 @@ static const uint8_t MSG_COMMAND   = 0x02;  // Cardputer -> Stamp
 static const uint8_t MSG_BACKLOG   = 0x03;  // Stamp -> Cardputer (history chunk)
 
 // ---- Command IDs (CommandMsg.command) ---------------------------------------
-static const uint8_t CMD_SET_TARGET  = 0x01;  // value = fan ON threshold (deg C)
-static const uint8_t CMD_TOGGLE_VENT = 0x02;  // toggle fan, ENTERS global manual
-static const uint8_t CMD_TOGGLE_HUM  = 0x05;  // toggle humidifier, ENTERS global manual
-static const uint8_t CMD_SET_AUTO    = 0x03;  // hand BOTH outputs back to auto
-static const uint8_t CMD_GET_BACKLOG = 0x04;  // value = "send samples newer than
-                                              //          this Stamp uptime (s)"
-static const uint8_t CMD_REFRESH     = 0x06;  // force an out-of-cycle DHT read
-                                              // (value unused)
-static const uint8_t CMD_SET_TARGET_RH = 0x07;  // value = humidify-below thr (%RH)
-static const uint8_t CMD_SET_VENT_RH   = 0x08;  // value = venting-above thr (%RH)
+static const uint8_t CMD_SET_TARGET     = 0x01; // value = fan ON threshold (deg C)
+static const uint8_t CMD_TOGGLE_VENT    = 0x02; // toggle fan, ENTERS global manual
+static const uint8_t CMD_TOGGLE_HUM     = 0x05; // toggle humidifier, ENTERS global manual
+static const uint8_t CMD_SET_AUTO       = 0x03; // hand BOTH outputs back to auto
+static const uint8_t CMD_GET_BACKLOG    = 0x04; // value = "send samples newer than this Stamp uptime (s)"
+static const uint8_t CMD_REFRESH        = 0x06; // force an out-of-cycle DHT read (value unused)
+static const uint8_t CMD_SET_TARGET_RH  = 0x07; // value = humidify-below thr (%RH)
+static const uint8_t CMD_SET_VENT_RH    = 0x08; // value = venting-above thr (%RH)
 static const uint8_t CMD_SET_VENT_DELAY = 0x09; // value = vent on-delay (seconds)
+static const uint8_t CMD_HELLO          = 0x0A; // Cardputer announces itself on link-up:
+                                                // forces a fresh DHT read so the reply carries live values + setpoints
+                                                // at once (value unused)
 
 // ---- Control mode (TelemetryMsg.mode) -- now the SINGLE global mode ----------
 static const uint8_t MODE_MANUAL = 0;
 static const uint8_t MODE_AUTO   = 1;
 
 // ---- Backlog sample flags ----------------------------------------------------
-static const uint8_t FLAG_FAN  = 0x01;
-static const uint8_t FLAG_AUTO = 0x02;
-static const uint8_t FLAG_HUM  = 0x04;
+static const uint8_t FLAG_FAN    = 0x01;
+static const uint8_t FLAG_AUTO   = 0x02;
+static const uint8_t FLAG_HUM    = 0x04;
 static const uint8_t HUM_INVALID = 255;
 
 // ---- Backlog sizing -----------------------------------------------------------
@@ -97,9 +115,13 @@ typedef struct {
   uint8_t  mode;         // GLOBAL control mode: MODE_MANUAL / MODE_AUTO
   uint8_t  hum_on;       // 0/1, current humidifier state
   uint32_t uptime_s;     // Stamp uptime in seconds (backlog dedup reference)
-} TelemetryMsg;          // 16 bytes on the wire
+  float    target_temp;  // climate target_high = fan ON threshold (deg C)
+  float    hum_low;      // g_hum_low: humidify-below threshold (% RH)
+  float    vent_high;    // g_vent_high: venting-above threshold (% RH)
+  uint16_t vent_delay_s; // g_vent_delay_s: vent on-delay (seconds)
+} TelemetryMsg;          // 30 bytes on the wire
 
-// Cardputer -> Stamp, keyboard-triggered or automatic (backlog request).
+// Cardputer -> Stamp, keyboard-triggered or automatic (backlog request / hello).
 typedef struct {
   uint8_t type;     // MSG_COMMAND
   uint8_t command;  // CMD_*
