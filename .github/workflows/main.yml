@@ -28,10 +28,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # CI runner has no real secrets.yaml. Copy the committed template
-      # (dummy WiFi credentials) so the compile step can resolve !secret.
-      - name: Provide dummy secrets for build
-        run: cp secrets.yaml.example secrets.yaml
+      - name: Create secrets.yaml from GitHub Secrets
+        run: |
+          cat > secrets.yaml <<EOF
+          wifi_ssid: "${{ secrets.WIFI_SSID }}"
+          wifi_password: "${{ secrets.WIFI_PASSWORD }}"
+          EOF
 
       - name: Build ESPHome firmware
         id: build
