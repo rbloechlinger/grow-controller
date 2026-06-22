@@ -491,6 +491,7 @@ script:
   # re-evaluate humidity immediately (identical to the CMD_SET_AUTO handler).
   - id: enter_auto
     then:
+      - component.update: growbox_dht    # pull a fresh reading before we decide
       - lambda: |-
           id(g_latch) = false;
           id(temp_fan_demand) = false;
@@ -650,7 +651,7 @@ climate:
 # Local HMI on the Stamp: SH1107 128x64 OLED (Grove6) + M5 Dual Button (Grove5)
 # Layout C: big humidity number + linear bar (60..100 %) with target/vent marks.
 # Controls:
-#   BLUE  click      -> cycle manual mode  I=humidify  II=vent  III=both
+#   BLUE  click      -> cycle manual mode I=humidify; II=vent: III=both; AUTO=AUTO
 #   RED   hold       -> run selected mode while held
 #   RED   doubleclick-> latch selected mode ON (red press stops it again)
 #   BOTH             -> back to AUTO (regulated)
@@ -709,7 +710,8 @@ display:
       // ---- hero humidity ----
       if (rh_nan) d.printf(2, 10, id(font_huge), "--");
       else        d.printf(2, 10, id(font_huge), "%.0f", rh);
-      d.printf(42, 30, id(font_small), "%%");          // small percent (nudge x if it collides)
+      // small percent (nudge x if it collides)
+      d.printf(42, 30, id(font_small), "%%");
 
       // ---- secondary readouts (right) ----
       if (!isnan(tc)) d.printf(80, 14, id(font_small), "%.1f°C", tc);
@@ -718,7 +720,7 @@ display:
       // ---- humidity bar: 60..100 %, with target + vent marks ----
       const int bx = 4, by = 53, bw = 120, bh = 9;
       auto frac = [](float v) -> float { float f = (v - 60.0f) / 40.0f; return f < 0 ? 0.0f : (f > 1 ? 1.0f : f); };
-      if (!rh_nan) d.filled_rectangle(bx, by, (int) (bw * frac(rh)), bh);   // fill to current RH
+      if (!rh_nan) d.filled_rectangle(bx, by, (int) (bw * frac(rh)), bh);  // fill to current RH
       d.rectangle(bx, by, bw, bh);                                         // frame
       int tx = bx + (int) (bw * frac(id(g_hum_low)));                      // target mark (bold)
       d.line(tx, by - 4, tx, by + bh + 3);
@@ -740,19 +742,25 @@ binary_sensor:
       - delayed_on: 20ms
     on_press:
       - lambda: |-
-          if (id(btn_red).state) {                 // both held -> AUTO
+          // both held -> AUTO
+          if (id(btn_red).state) {
             id(g_combo) = true;
             id(enter_auto).execute();
             return;
           }
           if (id(g_combo)) return;
           if (id(growbox_climate).mode != climate::CLIMATE_MODE_OFF) {
-            auto call = id(growbox_climate).make_call();   // enter MANUAL at mode I
+            // enter MANUAL at mode I
+            auto call = id(growbox_climate).make_call();
             call.set_mode(climate::CLIMATE_MODE_OFF);
             call.perform();
             id(g_sel) = 1;
+          } else if (id(g_sel) >= 3) {
+            // III -> AUTO (enter_auto clears the latch + sends telemetry)
+            id(enter_auto).execute();
           } else {
-            id(g_sel) = id(g_sel) % 3 + 1;               // cycle I -> II -> III -> I
+            // I -> II -> III
+            id(g_sel) = id(g_sel) + 1;
           }
           id(apply_manual).execute();
           id(send_telemetry).execute();
