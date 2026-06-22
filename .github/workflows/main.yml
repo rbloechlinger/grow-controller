@@ -2,24 +2,21 @@
 name: Build & Publish Firmware
 
 on:
+  # Release builds: push a version tag like v6.3.0
   push:
-    branches: [main]
-    paths:
-      - "growbox.yaml"
-      - "protocol.h"
-      - ".github/workflows/build.yml"
+    tags:
+      - "v*"
+  # Test builds from any branch: Actions tab -> Run workflow -> pick the branch
   workflow_dispatch:
 
-# Required for GitHub Pages deployment from Actions
+# We push the built artifacts into the gh-pages branch, so we need write access
+# to repo contents. (No pages/id-token perms needed with the branch approach.)
 permissions:
-  contents: read
-  pages: write
-  id-token: write
+  contents: write
 
-# Allow only one concurrent deployment
 concurrency:
-  group: pages
-  cancel-in-progress: true
+  group: firmware-publish
+  cancel-in-progress: false   # don't abort a release deploy if another starts
 
 jobs:
   build:
@@ -28,40 +25,86 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # CI runner has no real secrets.yaml. Copy the committed template
-      # (dummy WiFi credentials) so the compile step can resolve !secret.
-      - name: Provide dummy secrets for build
-        run: cp secrets.yaml.example secrets.yaml
+      # Decide the version string and where it gets published:
+      #   - tag push  (vX.Y.Z) -> version = X.Y.Z
+      #                           dest    = firmware/X.Y.Z      (archived)
+      #                           is_release = true             (also refresh 'latest')
+      #   - dispatch  (branch) -> version = <branch>-<shortsha>
+      #                           dest    = firmware/branches/<branch>
+      #                           is_release = false            (leaves 'latest' untouched)
+      - name: Resolve version and target
+        id: meta
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+            DEST="firmware/${VERSION}"
+            IS_RELEASE=true
+          else
+            BR="${GITHUB_REF_NAME//\//-}"          # slashes -> dashes for path safety
+            VERSION="${BR}-${GITHUB_SHA::7}"
+            DEST="firmware/branches/${BR}"
+            IS_RELEASE=false
+          fi
+          echo "version=$VERSION"        >> "$GITHUB_OUTPUT"
+          echo "dest=$DEST"              >> "$GITHUB_OUTPUT"
+          echo "is_release=$IS_RELEASE"  >> "$GITHUB_OUTPUT"
+          echo "Resolved version=$VERSION dest=$DEST release=$IS_RELEASE"
 
-      - name: Build ESPHome firmware
+      - name: Build firmware
         id: build
         uses: esphome/build-action@v7
         with:
           yaml-file: growbox.yaml
-          # Produce a manifest.json that the update: component can consume directly
+          version: latest                # ESPHome version used to compile
           complete-manifest: true
-          release-url: https://github.com/${{ github.repository }}
+          release-url: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+          # Inject the resolved version into esphome.project.version (see growbox.yaml)
+          substitutions: |
+            fw_version=${{ steps.meta.outputs.version }}
 
-      # Normalize the build output to a stable, predictable path so the
-      # Stamp's manifest source URL never changes between builds.
-      - name: Stage Pages output
+      # Publish into gh-pages, ACCUMULATING: existing versions are kept, only the
+      # touched paths are overwritten.
+      - name: Publish to gh-pages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILD_DIR: ${{ steps.build.outputs.name }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          DEST: ${{ steps.meta.outputs.dest }}
+          IS_RELEASE: ${{ steps.meta.outputs.is_release }}
         run: |
-          mkdir -p output/firmware
-          cp -r "${{ steps.build.outputs.name }}"/* output/firmware/
-          ls -R output
+          set -euo pipefail
+          REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: output
+          # Clone the existing gh-pages branch, or start an empty orphan if first run.
+          if git clone --depth 1 --branch gh-pages "$REPO_URL" gh-pages 2>/dev/null; then
+            echo "Cloned existing gh-pages"
+          else
+            echo "gh-pages does not exist yet -- creating it"
+            git clone --depth 1 "$REPO_URL" gh-pages
+            cd gh-pages
+            git checkout --orphan gh-pages
+            git rm -rf . >/dev/null 2>&1 || true
+            cd ..
+          fi
 
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+          cd gh-pages
+          # .nojekyll: serve files verbatim (no Jekyll processing of the README etc.)
+          touch .nojekyll
+
+          # Archived, version-pinned copy
+          mkdir -p "$DEST"
+          cp -r "../$BUILD_DIR/"* "$DEST/"
+
+          # Releases also refresh the stable 'latest' manifest that the Stamp polls
+          # at firmware/manifest.json (its fixed source URL).
+          if [ "$IS_RELEASE" = "true" ]; then
+            mkdir -p firmware
+            cp -r "../$BUILD_DIR/"* firmware/
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "publish ${VERSION} -> ${DEST}$([ "$IS_RELEASE" = true ] && echo ' (+latest)')" \
+            || { echo "Nothing changed"; exit 0; }
+          git push origin gh-pages
