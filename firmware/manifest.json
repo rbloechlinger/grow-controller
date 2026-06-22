@@ -1,0 +1,25 @@
+{
+  "name": "rbloechlinger.growbox",
+  "version": "6.2.0",
+  "home_assistant_domain": "esphome",
+  "new_install_prompt_erase": false,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "ota": {
+        "path": "growbox-esp32s3.ota.bin",
+        "md5": "a42135c25b847d403866d538e601fc01",
+        "sha256": "653450e0668fe3704ce27e360deff20a8205f88da645fd030c32c9d97d599d39",
+        "release_url": "https://github.com/rbloechlinger/grow-controller/releases/tag/v6.3.0"
+      },
+      "parts": [
+        {
+          "path": "growbox-esp32s3.factory.bin",
+          "offset": 0,
+          "md5": "101ed6f4528b5ea45cd9ca6e422695ee",
+          "sha256": "29a2ffca12fb482865b6b4aa3695fb02c5f937ce790660ae1570141ea035069d"
+        }
+      ]
+    }
+  ]
+}
