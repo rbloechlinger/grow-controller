@@ -1,40 +1,57 @@
+# .github/workflows/build.yml
 name: Build & Publish Firmware
 
 on:
   push:
     branches: [main]
+    paths:
+      - "growbox.yaml"
+      - "protocol.h"
+      - ".github/workflows/build.yml"
   workflow_dispatch:
 
+# Required for GitHub Pages deployment from Actions
 permissions:
   contents: read
   pages: write
   id-token: write
 
+# Allow only one concurrent deployment
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      # CI has no real secrets.yaml — generate dummy values so compile succeeds
-      - name: Create dummy secrets for build
+      # CI runner has no real secrets.yaml. Copy the committed template
+      # (dummy WiFi credentials) so the compile step can resolve !secret.
+      - name: Provide dummy secrets for build
         run: cp secrets.yaml.example secrets.yaml
 
-      - name: Build firmware
+      - name: Build ESPHome firmware
+        id: build
         uses: esphome/build-action@v7
-        id: esphome-build
         with:
           yaml-file: growbox.yaml
-          # release-url points to where the manifest will live on Pages
+          # Produce a manifest.json that the update: component can consume directly
           complete-manifest: true
+          release-url: https://github.com/${{ github.repository }}
 
-      - name: Assemble Pages output
+      # Normalize the build output to a stable, predictable path so the
+      # Stamp's manifest source URL never changes between builds.
+      - name: Stage Pages output
         run: |
-          mkdir -p output
-          mv "${{ steps.esphome-build.outputs.name }}" output/
-          # manifest.json lives at the root of the build folder
+          mkdir -p output/firmware
+          cp -r "${{ steps.build.outputs.name }}"/* output/firmware/
+          ls -R output
 
-      - uses: actions/upload-pages-artifact@v3
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
         with:
           path: output
 
@@ -45,5 +62,6 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - id: deployment
+      - name: Deploy to GitHub Pages
+        id: deployment
         uses: actions/deploy-pages@v4
