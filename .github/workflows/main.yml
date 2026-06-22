@@ -1,0 +1,49 @@
+name: Build & Publish Firmware
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # CI has no real secrets.yaml — generate dummy values so compile succeeds
+      - name: Create dummy secrets for build
+        run: cp secrets.yaml.example secrets.yaml
+
+      - name: Build firmware
+        uses: esphome/build-action@v7
+        id: esphome-build
+        with:
+          yaml-file: growbox.yaml
+          # release-url points to where the manifest will live on Pages
+          complete-manifest: true
+
+      - name: Assemble Pages output
+        run: |
+          mkdir -p output
+          mv "${{ steps.esphome-build.outputs.name }}" output/
+          # manifest.json lives at the root of the build folder
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: output
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
