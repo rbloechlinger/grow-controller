@@ -842,9 +842,9 @@ display:
 
       // ---- top row: mode (left) + status / lock (right) ----
       const char *mode = auto_mode      ? "AUTO"
-                       : id(g_sel) == 1 ? "I"
-                       : id(g_sel) == 2 ? "II"
-                       :                  "III";
+                       : id(g_sel) == 1 ? "H"
+                       : id(g_sel) == 2 ? "V"
+                       :                  "H+V";
       d.printf(0, 0, id(font_small), "%s", mode);
 
       const char *status = id(g_latch)   ? "LOCK"
