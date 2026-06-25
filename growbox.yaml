@@ -85,7 +85,12 @@ substitutions:
   # pipeline OVERRIDES it on a tag push via `-s fw_version=<X.Y.Z>` (see
   # .github/workflows/main.yml), so a `git tag vX.Y.Z` stamps the manifest and
   # boot log automatically. Keep this in rough sync with the latest tag.
-  fw_version: "6.3.2"
+  fw_version: "6.3.3"
+
+  # Device-facing OTA manifest (GitHub Pages, no redirect -> fits the small RX
+  # buffer; GitHub Releases would 30x-redirect and overflow it). run_ota_window
+  # fetches this on demand to decide whether a newer image exists.
+  ota_manifest_url: "https://rbloechlinger.github.io/grow-controller/firmware/manifest.json"
 
   # Fixed ESP-NOW channel. The Cardputer MUST use the same value.
   espnow_channel: "1"
@@ -134,6 +139,11 @@ esphome:
   on_boot:
     priority: -100   # end of setup: runs AFTER the climate restored its state
     then:
+      # Pin the ESP-NOW channel here: with a wifi: block present we can no longer
+      # set a static `channel:` on espnow: (mutually exclusive in the schema), so
+      # we fix channel 1 at boot instead. After an OTA reboot this is what brings
+      # the Cardputer link back up on the right channel.
+      - espnow.set_channel: ${espnow_channel}
       - lambda: |-
           // Boot in MANUAL: force the climate (= the single global mode) to
           // OFF, overriding any AUTO restored from flash. Both outputs stay
@@ -144,6 +154,21 @@ esphome:
           id(hum_lockout_ms) = 0;
           ESP_LOGI("growbox", "Boot: MANUAL mode (fan + humidifier off)");
 
+          // OTA AUTO-restore: if this boot follows a DELIBERATE OTA reboot that
+          // was opened while the box was in AUTO, resume AUTO now. The flag is
+          // persisted (restore_value: yes) and set ONLY in run_ota_window, so an
+          // ordinary brownout reboot (flag clear) still lands in MANUAL -- the
+          // brownout-safety default is preserved.
+          if (id(g_restore_auto_after_ota)) {
+            id(g_restore_auto_after_ota) = false;          // one-shot
+            id(temp_fan_demand) = false;
+            id(hum_vent)        = false;
+            auto a = id(growbox_climate).make_call();
+            a.set_mode(climate::CLIMATE_MODE_COOL);
+            a.perform();
+            ESP_LOGI("growbox", "Boot: AUTO restored after OTA");
+          }
+
 esp32:
   board: m5stack-stamps3
   framework:
@@ -152,6 +177,42 @@ esp32:
 # Logs over native USB (no network logging without WiFi).
 logger:
   hardware_uart: USB_SERIAL_JTAG
+
+# ----------------------------------------------------------------------------
+# OTA over WiFi -- DORMANT by default. ESP-NOW owns the radio in normal
+# operation; WiFi is only brought up on demand by run_ota_window (CMD_OTA) and
+# we reboot back to ESP-NOW afterwards (the native espnow: component binds the
+# radio only at setup, so there is no clean live switch-back).
+#   enable_on_boot: false -> WiFi stays off at boot, ESP-NOW keeps the radio.
+#   reboot_timeout:  0s   -> MANDATORY: otherwise the WiFi component reboots the
+#                            device whenever it is "disconnected" (i.e. always,
+#                            since we keep it off) -> boot loop.
+# ----------------------------------------------------------------------------
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  enable_on_boot: false
+  reboot_timeout: 0s
+  power_save_mode: none
+
+http_request:
+  verify_ssl: false      # GitHub Pages is HTTPS but we ship no CA bundle and GH
+    # rotates certs; the image is integrity-checked by the
+  # md5/sha256 in the manifest, so skip cert validation.
+  buffer_size_rx: 2048   # esp32 default is 512 -- too small for the manifest
+  # JSON + headers; enlarge so the fetch doesn't truncate.
+  timeout: 10s
+
+ota:
+  - platform: http_request   # OTA-from-URL flash path; also selects an OTA-capable
+    # partition table (hence the one-time wired flash).
+
+update:
+  - platform: http_request
+    id: fw_update
+    name: "Growbox Firmware"
+    source: ${ota_manifest_url}
+    update_interval: never   # never auto-poll; run_ota_window checks on demand
 
 # ----------------------------------------------------------------------------
 # Burst-limiter settle clock. millis() until which AUTO must NOT re-trigger a
@@ -164,6 +225,14 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: '0'
+  # --- OTA AUTO-restore flag -------------------------------------------------
+  # Set true by run_ota_window ONLY when an OTA window opens while the box is in
+  # AUTO; on_boot consumes it to resume AUTO after the post-OTA reboot. Persisted
+  # (NVS) so it survives the reboot. A brownout reboot leaves it clear -> MANUAL.
+  - id: g_restore_auto_after_ota
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
   # --- Fan demand flags: resolve_fan ORs these into the single relay state ---
   - id: temp_fan_demand     # set by the climate cool/idle actions (temperature)
     type: bool
@@ -218,7 +287,9 @@ globals:
 #  before the user includes.)
 # ----------------------------------------------------------------------------
 espnow:
-  channel: ${espnow_channel}
+  # No static `channel:` here -- it is mutually exclusive with the wifi: block in
+  # ESPHome's schema. The channel is pinned to ${espnow_channel} at boot via
+  # espnow.set_channel (see on_boot), and re-pinned after every OTA reboot.
   peers:
     - ${cardputer_mac}
   on_receive:
@@ -414,6 +485,16 @@ espnow:
                        : "Manual DHT refresh");
             return;
           }
+          case CMD_OTA: {
+            // Open an on-demand WiFi OTA window. run_ota_window shuts the
+            // actuators, brings WiFi up, checks the GitHub Pages manifest,
+            // flashes if a newer image exists, then reboots back to ESP-NOW.
+            // Return so the trailing cached telemetry send is skipped -- the
+            // script emits its own final frame before WiFi seizes the radio.
+            ESP_LOGI("growbox", "OTA window requested");
+            id(run_ota_window).execute();
+            return;
+          }
           default:
             ESP_LOGW("growbox", "Unknown command 0x%02X", command);
             return;
@@ -450,6 +531,62 @@ script:
             std::vector<uint8_t> pkt(sizeof(TelemetryMsg));
             memcpy(pkt.data(), &m, sizeof(m));
             return pkt;
+
+  # --------------------------------------------------------------------------
+  # On-demand OTA window (CMD_OTA). The native espnow: component binds the radio
+  # only at setup, so there is no clean live switch back to ESP-NOW -- the only
+  # way back is a reboot. Sequence:
+  #   1) remember whether we were in AUTO, so on_boot can restore it post-flash
+  #   2) drop to MANUAL and kill both actuators -- this also sheds load, so the
+  #      WiFi-bring-up + flash current spike is less likely to brown out the
+  #      StampS3 (the IRF520 rail is the known weak spot here)
+  #   3) one final telemetry frame so the Cardputer sees us go to MANUAL/dark
+  #   4) bring WiFi up, wait for the AP, fetch the manifest, flash IF newer
+  #   5) reboot unconditionally -> on_boot re-pins the ESP-NOW channel and (if we
+  #      were in AUTO) restores AUTO. If a newer image flashed, perform() already
+  #      rebooted us into it before we reach the manual reboot below.
+  # mode: single -> a second CMD_OTA while a window is open is ignored.
+  # --------------------------------------------------------------------------
+  - id: run_ota_window
+    mode: single
+    then:
+      - lambda: |-
+          // remember AUTO so the post-OTA boot can return to it
+          id(g_restore_auto_after_ota) =
+              (id(growbox_climate).mode != climate::CLIMATE_MODE_OFF);
+          // drop to MANUAL and shed load before the high-current WiFi/flash phase
+          auto call = id(growbox_climate).make_call();
+          call.set_mode(climate::CLIMATE_MODE_OFF);
+          call.perform();
+          id(temp_fan_demand) = false;
+          id(hum_vent)        = false;
+          id(humidifier).turn_off();
+          id(fan_relay).turn_off();
+          ESP_LOGI("growbox", "OTA: actuators off, opening update window");
+      - script.execute: send_telemetry     # let the Cardputer record MANUAL before we go dark
+      - delay: 500ms
+      - wifi.enable:
+      - wait_until:
+          condition:
+            wifi.connected:
+          timeout: 30s
+      - if:
+          condition:
+            wifi.connected:
+          then:
+            - logger.log: "OTA: WiFi connected, checking manifest"
+            - component.update: fw_update   # fresh manifest fetch -> sets AVAILABLE / NO_UPDATE
+            - delay: 8s                      # let the async fetch + JSON parse finish
+            - update.perform: fw_update      # installs ONLY if newer; on success it reboots into the new image
+          else:
+            - logger.log:
+                level: WARN
+                format: "OTA: WiFi did not connect within 30s -- aborting window"
+      # Reached only if nothing flashed (already current, or WiFi failed).
+      # Reboot to rebuild ESP-NOW cleanly.
+      - delay: 2s
+      - logger.log: "OTA: rebooting to restore ESP-NOW"
+      - lambda: 'App.safe_reboot();'
 
   # --------------------------------------------------------------------------
   # Humidifier burst: ONE self-terminating mist pulse. Runs the output for
@@ -536,7 +673,7 @@ sensor:
     address: 0x44         # SHT30 default (bare CJMCU board / M5 ENV III)
     heater_enabled: false # SHT30 heater is all-or-nothing (no duty limiter like
       # the SHT4x). Leave OFF: a permanently-on heater self-
-      # heats the die and biases RH low. Only pulse it on if
+    # heats the die and biases RH low. Only pulse it on if
     # condensation ever pegs the reading near 100 %.
     temperature:
       name: "Temperature"
