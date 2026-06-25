@@ -50,6 +50,33 @@ jobs:
           echo "is_release=$IS_RELEASE"  >> "$GITHUB_OUTPUT"
           echo "Resolved version=$VERSION dest=$DEST release=$IS_RELEASE"
 
+      # growbox.yaml uses !secret for the WiFi credentials (OTA window), so
+      # ESPHome needs a secrets.yaml at COMPILE time. It is gitignored, so build
+      # it here from GitHub repository Secrets (Settings -> Secrets and variables
+      # -> Actions: WIFI_SSID, WIFI_PASSWORD).
+      #
+      # SECURITY NOTE: these credentials are compiled INTO the firmware that gets
+      # published to the public gh-pages branch -- the password is extractable
+      # from the .bin. Use a dedicated/guest IoT SSID whose password you don't
+      # mind being effectively public. (Single-quoted YAML + doubled single
+      # quotes so passwords with special characters survive.)
+      - name: Create secrets.yaml
+        env:
+          WIFI_SSID: ${{ secrets.WIFI_SSID }}
+          WIFI_PASSWORD: ${{ secrets.WIFI_PASSWORD }}
+        run: |
+          if [ -z "${WIFI_SSID}" ] || [ -z "${WIFI_PASSWORD}" ]; then
+            echo "::error::Repository secrets WIFI_SSID / WIFI_PASSWORD are not set." \
+                 "Add them under Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          esc() { printf '%s' "$1" | sed "s/'/''/g"; }
+          {
+            printf "wifi_ssid: '%s'\n"     "$(esc "$WIFI_SSID")"
+            printf "wifi_password: '%s'\n" "$(esc "$WIFI_PASSWORD")"
+          } > secrets.yaml
+          echo "secrets.yaml written (ssid length: ${#WIFI_SSID}, pw length: ${#WIFI_PASSWORD})"
+
       - name: Build firmware
         id: build
         uses: esphome/build-action@v7
