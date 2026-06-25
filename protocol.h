@@ -5,6 +5,11 @@
  *   - the ESPHome folder next to growbox.yaml (Stamp S3)
  *   - cardputer/include/ in the Cardputer PlatformIO project
  *
+ * v6.1 changes (OTA trigger): new command CMD_OTA opens an on-demand WiFi
+ *   update window on the Stamp. Wire structs are UNCHANGED, so this is backward
+ *   compatible and does NOT bump PROTOCOL_VERSION (same rule as v5.1/v5.3/v5.4);
+ *   both devices need this build for the feature to do anything.
+ *
  * v6 changes (setpoint echo + startup handshake):
  *   - TelemetryMsg now carries the live setpoints (target_temp, hum_low,
  *     vent_high, vent_delay_s). The Stamp is the single source of truth for
@@ -84,6 +89,11 @@ static const uint8_t CMD_SET_VENT_DELAY = 0x09; // value = vent on-delay (second
 static const uint8_t CMD_HELLO          = 0x0A; // Cardputer announces itself on link-up:
                                                 // forces a fresh DHT read so the reply carries live values + setpoints
                                                 // at once (value unused)
+static const uint8_t CMD_OTA            = 0x0B; // open an on-demand WiFi OTA window on the Stamp (value unused):
+                                                // the Stamp shuts its actuators, brings WiFi up, checks the GitHub
+                                                // Pages manifest, flashes if newer, then reboots back to ESP-NOW.
+                                                // Pure command add -> CommandMsg unchanged -> NO PROTOCOL_VERSION bump
+                                                // (an old Stamp would just log it as unknown and ignore it).
 
 // ---- Control mode (TelemetryMsg.mode) -- now the SINGLE global mode ----------
 static const uint8_t MODE_MANUAL = 0;

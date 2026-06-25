@@ -35,8 +35,10 @@
 #   Temperature: fan ON >= 28 C, OFF <= 24 C (target 28 C, dead band 4 C)
 #   Humidity:    humidifier ON < 75 % RH (pulsed); see burst limiter below.
 #   Venting:     fan ON >= 88 % RH, OFF <= 83 % RH (sheds excess moisture).
-#   NOTE: the DHT11 tops out around 80-90 % RH at +-5 % accuracy -- it is at
-#   the edge of its range here. Works, but a DHT22 would be the upgrade.
+#   SENSOR (v6.3.0): SHT30 over I2C (sht3xd @ 0x44), shares the OLED bus on
+#   GPIO13/GPIO15. +-2 %RH / +-0.3 C across the full range -- no longer pinned
+#   at the edge like the old DHT11. (Older comments still mention "DHT11 noise";
+#   the control logic is unchanged, the readings are just cleaner now.)
 #
 # Humidifier (v5): 5 VDC mist module switched via an IRF520 MOSFET board on
 # GPIO10 (yellow/SIG of the Grove port labelled G10/G11).
@@ -79,6 +81,12 @@
 # =============================================================================
 
 substitutions:
+  # Firmware version. Local/USB builds use this literal; the GitHub Actions
+  # pipeline OVERRIDES it on a tag push via `-s fw_version=<X.Y.Z>` (see
+  # .github/workflows/main.yml), so a `git tag vX.Y.Z` stamps the manifest and
+  # boot log automatically. Keep this in rough sync with the latest tag.
+  fw_version: "6.3.2"
+
   # Fixed ESP-NOW channel. The Cardputer MUST use the same value.
   espnow_channel: "1"
   # MAC address of the Cardputer -- read it with mac_printer.ino first, then
@@ -108,7 +116,7 @@ substitutions:
   humidity_vent_high: "95.0"  # initial g_vent_high: fan starts venting at/above (%RH)
   vent_hyst: "5.0"            # venting stops at g_vent_high - vent_hyst (%RH)
   vent_delay_s: "300"        # initial g_vent_delay_s: RH must stay above the vent
-    # threshold this long before venting (0 = immediate).
+  # threshold this long before venting (0 = immediate).
   # Effective resolution is the 30 s DHT interval.
 
 esphome:
@@ -119,7 +127,7 @@ esphome:
   # ESPHome prints "Project rbloechlinger.growbox version 5.4.0" in the boot log.
   project:
     name: "rbloechlinger.growbox"
-    version: "6.2.0"
+    version: "${fw_version}"   # literal for USB builds; CI injects the tag version
   # Pull in the shared wire format so the lambdas below can use the enums/structs.
   includes:
     - protocol.h
@@ -523,10 +531,13 @@ script:
       - script.execute: send_telemetry
 
 sensor:
-  - platform: dht
-    id: growbox_dht       # lets CMD_REFRESH force an out-of-cycle read
-    pin: GPIO1
-    model: DHT11          # change to DHT22 if it's the white "Pro" sensor
+  - platform: sht3xd
+    id: growbox_dht       # keep this id: CMD_REFRESH and component.update target it
+    address: 0x44         # SHT30 default (bare CJMCU board / M5 ENV III)
+    heater_enabled: false # SHT30 heater is all-or-nothing (no duty limiter like
+      # the SHT4x). Leave OFF: a permanently-on heater self-
+      # heats the die and biases RH low. Only pulse it on if
+    # condensation ever pegs the reading near 100 %.
     temperature:
       name: "Temperature"
       id: growbox_temp
