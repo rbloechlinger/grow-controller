@@ -77,6 +77,17 @@ jobs:
           } > secrets.yaml
           echo "secrets.yaml written (ssid length: ${#WIFI_SSID}, pw length: ${#WIFI_PASSWORD})"
 
+      # Stamp the resolved version straight into growbox.yaml. The build-action's
+      # `substitutions:` input does NOT override a substitution that the YAML's
+      # own `substitutions:` block already defines, so fw_version was sticking at
+      # the YAML default (e.g. tag v6.3.4 shipped an internally-6.3.3 manifest).
+      # A direct sed is unambiguous: now the git tag is the single source of
+      # truth for the internal version, the published path AND the release_url.
+      - name: Stamp version into growbox.yaml
+        run: |
+          sed -i -E "s/^([[:space:]]*fw_version:[[:space:]]*).*/\1\"${{ steps.meta.outputs.version }}\"/" growbox.yaml
+          echo "Stamped:"; grep -n 'fw_version:' growbox.yaml
+
       - name: Build firmware
         id: build
         uses: esphome/build-action@v7
@@ -85,9 +96,8 @@ jobs:
           version: latest                # ESPHome version used to compile
           complete-manifest: true
           release-url: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}
-          # Inject the resolved version into esphome.project.version (see growbox.yaml)
-          substitutions: |
-            fw_version=${{ steps.meta.outputs.version }}
+          # NOTE: version is stamped into the file above (the build-action
+          # substitutions input proved ineffective against the YAML default).
 
       # Publish into gh-pages, ACCUMULATING: existing versions are kept, only the
       # touched paths are overwritten.
