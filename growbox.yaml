@@ -85,7 +85,7 @@ substitutions:
   # pipeline OVERRIDES it on a tag push via `-s fw_version=<X.Y.Z>` (see
   # .github/workflows/main.yml), so a `git tag vX.Y.Z` stamps the manifest and
   # boot log automatically. Keep this in rough sync with the latest tag.
-  fw_version: "6.3.3"
+  fw_version: "6.3.6"
 
   # Device-facing OTA manifest (GitHub Pages, no redirect -> fits the small RX
   # buffer; GitHub Releases would 30x-redirect and overflow it). run_ota_window
