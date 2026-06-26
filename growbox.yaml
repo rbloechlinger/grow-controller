@@ -808,9 +808,8 @@ climate:
 i2c:
   sda: GPIO13        # Grove6 IO1 (SDA/SCL swapped vs. silk to get an ACK)
   scl: GPIO15        # Grove6 IO2
-  frequency: 400kHz
-  scan: false
-
+  frequency: 100kHz  # DIAG: down from 400kHz — robust on shared Grove bus
+  scan: true         # DIAG: log which addresses ACK at boot
 font:
   - file: "gfonts://Roboto@700"
     id: font_huge
