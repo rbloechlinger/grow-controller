@@ -103,6 +103,7 @@ static const uint8_t MODE_AUTO   = 1;
 static const uint8_t FLAG_FAN    = 0x01;
 static const uint8_t FLAG_AUTO   = 0x02;
 static const uint8_t FLAG_HUM    = 0x04;
+static const uint8_t FLAG_HEAT   = 0x08;  // backlog only: relay/heater on (pure add, no PROTOCOL_VERSION bump)
 static const uint8_t HUM_INVALID = 255;
 
 // ---- Backlog sizing -----------------------------------------------------------
