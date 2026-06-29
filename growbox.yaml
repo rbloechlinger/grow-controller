@@ -550,6 +550,7 @@ script:
             m.mode        = (id(growbox_climate).mode == climate::CLIMATE_MODE_OFF)
                               ? MODE_MANUAL : MODE_AUTO;
             m.hum_on      = id(humidifier).state ? 1 : 0;
+            m.heat_on     = id(heater).state ? 1 : 0;   // relay/heater on (v7)
             m.uptime_s    = millis() / 1000UL;
             m.target_temp  = id(growbox_climate).target_temperature_high;
             m.hum_low      = id(g_hum_low);

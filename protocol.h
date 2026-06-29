@@ -5,6 +5,13 @@
  *   - the ESPHome folder next to growbox.yaml (Stamp S3)
  *   - cardputer/include/ in the Cardputer PlatformIO project
  *
+ * v7 changes (heater live status): TelemetryMsg gained heat_on, the live
+ *   relay/heater state, so the Cardputer can show and log whether the heater is
+ *   running right now (FLAG_HEAT already carried it in the backlog, but not in
+ *   live frames). The packet grew 30 -> 31 bytes: this is an INCOMPATIBLE wire
+ *   change, so PROTOCOL_VERSION bumps to 7 and BOTH devices must be reflashed
+ *   (mixed versions silently drop each other's frames).
+ *
  * v6.1 changes (OTA trigger): new command CMD_OTA opens an on-demand WiFi
  *   update window on the Stamp. Wire structs are UNCHANGED, so this is backward
  *   compatible and does NOT bump PROTOCOL_VERSION (same rule as v5.1/v5.3/v5.4);
@@ -69,7 +76,7 @@
 // ride along on unchanged frames and are tracked by the per-device firmware
 // versions instead. Identical PROTOCOL_VERSION on both ends therefore means
 // "the frames line up"; a mismatch means reflash both.
-#define PROTOCOL_VERSION 6
+#define PROTOCOL_VERSION 7
 
 // ---- Message types (first byte on the wire) --------------------------------
 static const uint8_t MSG_TELEMETRY = 0x01;  // Stamp -> Cardputer (live)
@@ -125,12 +132,13 @@ typedef struct {
   uint8_t  fan_on;       // 0/1, current fan relay state
   uint8_t  mode;         // GLOBAL control mode: MODE_MANUAL / MODE_AUTO
   uint8_t  hum_on;       // 0/1, current humidifier state
+  uint8_t  heat_on;      // 0/1, current heater relay state (v7)
   uint32_t uptime_s;     // Stamp uptime in seconds (backlog dedup reference)
   float    target_temp;  // climate target_high = fan ON threshold (deg C)
   float    hum_low;      // g_hum_low: humidify-below threshold (% RH)
   float    vent_high;    // g_vent_high: venting-above threshold (% RH)
   uint16_t vent_delay_s; // g_vent_delay_s: vent on-delay (seconds)
-} TelemetryMsg;          // 30 bytes on the wire
+} TelemetryMsg;          // 31 bytes on the wire
 
 // Cardputer -> Stamp, keyboard-triggered or automatic (backlog request / hello).
 typedef struct {
